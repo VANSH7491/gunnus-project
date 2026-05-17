@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m venv .venv)",
+      "Bash(.venv/bin/pip install *)",
+      "Bash(.venv/bin/pytest -q)",
+      "Bash(.venv/bin/python --version)",
+      "Bash(brew --prefix)",
+      "Read(//opt/homebrew/**)",
+      "Read(//Applications/**)",
+      "Read(//opt/**)",
+      "Read(//usr/bin/**)",
+      "Bash(command -v conda mamba pyenv asdf)",
+      "Bash(.venv/bin/pytest -v)"
+    ]
+  }
+}

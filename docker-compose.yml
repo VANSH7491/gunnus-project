@@ -1,0 +1,33 @@
+services:
+  mongo:
+    image: mongo:7
+    container_name: metadata-mongo
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  api:
+    build: .
+    container_name: metadata-api
+    restart: unless-stopped
+    depends_on:
+      mongo:
+        condition: service_healthy
+    environment:
+      MONGO_URI: "mongodb://mongo:27017"
+      MONGO_DB: "metadata_inventory"
+      FETCH_TIMEOUT_SECONDS: "15"
+      LOG_LEVEL: "INFO"
+    ports:
+      - "8000:8000"
+
+volumes:
+  mongo_data:
