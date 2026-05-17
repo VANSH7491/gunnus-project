@@ -1,10 +1,10 @@
 # HTTP Metadata Inventory Service
 
-A FastAPI service that collects and serves HTTP metadata (response headers,
-cookies, and page source) for arbitrary URLs, backed by MongoDB. On a cache
-miss, the GET endpoint replies immediately with `202 Accepted` and triggers an
-**in-process background task** to fetch and persist the metadata — no external
-worker, broker, or service-to-self HTTP call.
+A FastAPI service that collects HTTP response **headers**, **cookies**, and
+**page source** for arbitrary URLs and serves them from a MongoDB-backed
+inventory. On a cache miss, GET replies immediately with `202 Accepted`
+and triggers an **in-process background task** to fetch and persist the
+metadata — no broker, no service-to-self HTTP call.
 
 ## Stack
 
@@ -22,130 +22,231 @@ worker, broker, or service-to-self HTTP call.
 
 ```
 app/
-  config.py        # pydantic-settings, env-driven configuration
+  config.py        # pydantic-settings — env-driven configuration
   database.py      # Motor connection with retry-on-startup
   dependencies.py  # FastAPI DI providers
-  models.py        # Pydantic models (request/response/persistence)
+  models.py        # Pydantic models (request, response, persistence)
   repository.py    # Data-access layer over the Mongo collection
-  services.py      # Fetcher + orchestration logic + URL normalisation
+  services.py      # Fetcher + service + URL normalisation + SSRF guard
   routers/
     metadata.py    # POST and GET endpoints
   main.py          # App factory + lifespan
 tests/
-  conftest.py      # In-memory Mongo + httpx MockTransport fixtures
-  test_metadata.py # Unit + integration tests
+  conftest.py      # In-memory Mongo + MockTransport fixtures
+  test_metadata.py # 28 hermetic tests
 docker-compose.yml
 Dockerfile
 requirements.txt
+pytest.ini
+.env.example
 ```
 
-A clear three-layer split is maintained: **transport** (routers) → **logic**
-(services) → **data** (repository).
+Three-layer separation: **transport** (`routers`) → **logic** (`services`)
+→ **data** (`repository`).
 
-## Run with Docker Compose
+---
+
+## How to run and test
+
+### 1. Start the stack
 
 ```bash
 docker compose up --build
 ```
 
-This brings up:
+First run builds the API image (~1–2 min) and pulls `mongo:7`. Wait for:
 
-- `mongo` — MongoDB 7 with a persistent named volume and a healthcheck
-- `api` — the FastAPI service on `http://localhost:8000`, started only once
-  Mongo is healthy
+```
+metadata-api  | INFO ... Connected to MongoDB at mongodb://mongo:27017
+metadata-api  | INFO:     Uvicorn running on http://0.0.0.0:8000
+```
 
-OpenAPI docs: <http://localhost:8000/docs>
-ReDoc: <http://localhost:8000/redoc>
+Leave this terminal open — it streams logs from both containers.
 
-## API
+Or run detached and tail logs separately:
+```bash
+docker compose up --build -d
+docker compose logs -f api
+```
 
-### `POST /metadata`
+### 2. Verify it's alive
 
-Fetch a URL synchronously, store the result, return the stored record.
+In a second terminal:
+```bash
+curl http://localhost:8000/health
+# {"status":"ok"}
+```
+
+Swagger UI: <http://localhost:8000/docs>
+
+### 3. POST a real URL — synchronous fetch + store
 
 ```bash
 curl -X POST http://localhost:8000/metadata \
   -H "Content-Type: application/json" \
-  -d '{"url":"https://example.com"}'
+  -d '{"url":"https://httpbin.org/get"}'
 ```
 
-- `201 Created` on success — returns the full `MetadataRecord`.
-- `422` on malformed URL (Pydantic validation).
-- `400` on URLs missing a scheme/host.
-- `502` if the upstream URL cannot be fetched.
+Expected `201 Created` with the full `MetadataRecord` (headers, cookies,
+page_source, status_code, final_url, timestamps).
+
+POST a cookie-setting URL to verify multi-cookie capture:
+```bash
+curl -X POST http://localhost:8000/metadata \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://httpbin.org/cookies/set?freeform=blue"}'
+```
+
+You'll see `cookies: {"freeform": "blue"}` and the `final_url` ending in
+`/cookies` (httpbin redirects).
+
+### 4. GET — cache hit
+
+The URL you just POSTed is already in the inventory:
+```bash
+curl "http://localhost:8000/metadata?url=https://httpbin.org/get"
+# 200 OK + the stored record
+```
+
+### 5. GET — cache miss (the core spec requirement)
+
+A URL you have never asked for:
+```bash
+curl -i "http://localhost:8000/metadata?url=https://httpbin.org/headers"
+# HTTP/1.1 202 Accepted
+# {"url":"...","status":"pending","detail":"Metadata collection scheduled..."}
+```
+
+The API answered immediately. The background task is now fetching and
+storing. Wait ~1–2 seconds and ask again:
+```bash
+curl -i "http://localhost:8000/metadata?url=https://httpbin.org/headers"
+# HTTP/1.1 200 OK + the populated record
+```
+
+That's the spec's required behaviour: 202 → background task → 200 on the
+next call, with no broker and no service-to-self HTTP.
+
+### 6. Validation behaviour
+
+```bash
+# Malformed URL → 422
+curl -i -X POST http://localhost:8000/metadata \
+  -H "Content-Type: application/json" -d '{"url":"not-a-url"}'
+
+# SSRF guard blocks loopback by default → 400
+curl -i -X POST http://localhost:8000/metadata \
+  -H "Content-Type: application/json" -d '{"url":"http://127.0.0.1/secret"}'
+```
+
+### 7. Run the test suite inside the container
+
+The test suite is hermetic — `mongomock-motor` replaces Mongo,
+`httpx.MockTransport` replaces the network.
+
+```bash
+docker compose run --rm api pytest -v
+```
+
+Expected: **28 passed**.
+
+### 8. Inspect Mongo directly
+
+```bash
+docker compose exec mongo mongosh metadata_inventory
+```
+
+Then in `mongosh`:
+```javascript
+db.pages.find().pretty()
+db.pages.getIndexes()        // shows the unique index on `url`
+exit
+```
+
+### 9. Tear down
+
+`Ctrl+C` in the `docker compose up` terminal, then:
+```bash
+docker compose down            # remove containers, keep Mongo volume
+docker compose down -v         # also drop the Mongo volume (fresh state)
+```
+
+---
+
+## API reference
+
+### `POST /metadata`
+
+| Status | Meaning |
+| ------ | ------- |
+| `201`  | Fetched and persisted; full record in body. |
+| `400`  | Malformed URL or host blocked by the SSRF guard. |
+| `422`  | URL failed Pydantic `HttpUrl` validation. |
+| `502`  | Upstream URL could not be fetched (timeout, DNS, TLS). |
 
 ### `GET /metadata?url=…`
 
-Look up a URL in the inventory.
-
-```bash
-curl "http://localhost:8000/metadata?url=https://example.com"
-```
-
-- `200 OK` — record exists and is ready; the body contains headers, cookies,
-  page source, status code, and timestamps.
-- `202 Accepted` — record was missing (or previously failed/pending); a
-  background task has been scheduled and the URL will be available on a
-  subsequent request.
-- `400 Bad Request` — the URL is unparseable.
+| Status | Meaning |
+| ------ | ------- |
+| `200`  | Record exists and is `ready`; full body. |
+| `202`  | Cache miss or stale; background collection has been scheduled. |
+| `400`  | URL is malformed or blocked. |
 
 ### `GET /health`
 
 Liveness probe used by the Docker healthcheck.
 
-## Background-worker design
+---
 
-Per the spec, collection on a cache miss must:
+## Background-worker design (spec compliance)
 
-1. **Be triggered internally by the GET endpoint** — handled in
-   `app/routers/metadata.py` via FastAPI's `BackgroundTasks`.
-2. **Run independently of the request/response cycle** — `BackgroundTasks`
-   runs *after* the response is sent on the same event loop.
-3. **Avoid service-to-self HTTP calls** — the background task is a plain
-   `await service.collect_and_store(url)` call; no loopback HTTP, no broker.
-4. **Persist for future retrieval** — the same repository upserts the result;
-   the next GET reads it directly from Mongo.
+| Spec requirement | Implementation |
+| --- | --- |
+| Triggered internally by GET on cache miss | `BackgroundTasks.add_task` in [app/routers/metadata.py](app/routers/metadata.py) |
+| Runs independently of the request/response cycle | `BackgroundTasks` executes after the response is flushed, same event loop |
+| Avoid loops or service-to-self HTTP | Background task is a plain `await service.collect_and_store(url)` — no broker, no loopback HTTP |
+| Result persists for next GET | Same repository upsert; the next call reads it from Mongo |
 
-The route also calls `repo.mark_pending(url)` before scheduling so a concurrent
-GET for the same URL does not return a misleading "not in inventory" state.
+**Concurrent-fetch dedup.** A GET that finds an existing `pending` record
+with a fresh `updated_at` returns 202 without re-firing the collector
+(prevents duplicate upstream fetches). Pendings older than
+`PENDING_GRACE_SECONDS` are treated as stuck and retried.
 
-## URL normalisation
+---
 
-A canonical key form is used so trivial variations don't create duplicate
-records:
+## SSRF defence
 
-- scheme/host lowercased
-- default ports (`:80` / `:443`) stripped
-- fragment removed
-- empty path normalised to `/`
-- query string preserved (different queries are different pages)
+The service rejects IP-literal URLs targeting loopback / private (RFC1918)
+/ link-local / reserved / multicast ranges plus the `localhost` and
+`0.0.0.0` aliases. This blocks classic SSRF probes (e.g.
+`http://169.254.169.254/`, the AWS metadata service).
+
+It does **not** perform DNS resolution — close that gap with an egress
+firewall in production. Set `ALLOW_PRIVATE_HOSTS=true` to disable the
+guard for local development.
+
+---
 
 ## Configuration
 
-All settings come from environment variables (see `.env.example`):
+All settings come from environment variables — see [.env.example](.env.example).
 
-| Variable                        | Default                                            |
-| ------------------------------- | -------------------------------------------------- |
-| `MONGO_URI`                     | `mongodb://localhost:27017`                        |
-| `MONGO_DB`                      | `metadata_inventory`                               |
-| `MONGO_COLLECTION`              | `pages`                                            |
-| `MONGO_CONNECT_RETRIES`         | `10`                                               |
-| `MONGO_CONNECT_BACKOFF_SECONDS` | `1.5`                                              |
-| `FETCH_TIMEOUT_SECONDS`         | `15`                                               |
-| `FETCH_MAX_BYTES`               | `5000000`                                          |
-| `FETCH_MAX_REDIRECTS`           | `5`                                                |
-| `FETCH_USER_AGENT`              | `MetadataInventoryBot/1.0 (+...)`                  |
-| `LOG_LEVEL`                     | `INFO`                                             |
+| Variable                        | Default                                              |
+| ------------------------------- | ---------------------------------------------------- |
+| `MONGO_URI`                     | `mongodb://localhost:27017`                          |
+| `MONGO_DB`                      | `metadata_inventory`                                 |
+| `MONGO_COLLECTION`              | `pages`                                              |
+| `MONGO_CONNECT_RETRIES`         | `10`                                                 |
+| `MONGO_CONNECT_BACKOFF_SECONDS` | `1.5`                                                |
+| `FETCH_TIMEOUT_SECONDS`         | `15`                                                 |
+| `FETCH_MAX_BYTES`               | `5000000`                                            |
+| `FETCH_MAX_REDIRECTS`           | `5`                                                  |
+| `FETCH_USER_AGENT`              | `Mozilla/5.0 (compatible; metadata-inventory/1.0)`   |
+| `ALLOW_PRIVATE_HOSTS`           | `false`                                              |
+| `PENDING_GRACE_SECONDS`         | `30`                                                 |
+| `LOG_LEVEL`                     | `INFO`                                               |
 
-## Resilience
-
-- `MongoConnection.connect` retries with backoff so the API survives the
-  Mongo container booting after it.
-- The `api` service in compose `depends_on` Mongo's healthcheck — the API
-  only starts once Mongo answers `ping`.
-- Fetcher errors (timeouts, connection failures, bad TLS) are caught,
-  recorded as `status: failed` on the record, and surfaced as `502` on POST.
-- Response bodies are capped at `FETCH_MAX_BYTES` to bound memory.
+---
 
 ## Schema (MongoDB)
 
@@ -154,44 +255,34 @@ Collection: `pages`. Unique index on `url`.
 ```jsonc
 {
   "_id": "ObjectId(...)",
-  "url": "https://example.com/",
-  "status": "ready",                          // "pending" | "ready" | "failed"
+  "url":        "https://httpbin.org/cookies/set?freeform=blue",
+  "final_url":  "https://httpbin.org/cookies",
+  "status":     "ready",                                          // pending | ready | failed
   "status_code": 200,
-  "headers":            { "content-type": "..." },   // single-value view
-  "set_cookie_headers": [ "a=1; Path=/", "b=2; HttpOnly" ],  // multi-value, lossless
-  "cookies":            { "a": "1", "b": "2" },      // parsed name -> value
+  "headers":    { "content-type": "text/html; charset=utf-8" },
+  "set_cookie_headers": [ "freeform=blue; Path=/" ],
+  "cookies":    { "freeform": "blue" },
   "page_source": "<html>…</html>",
-  "error": null,
-  "created_at": ISODate(...),
-  "updated_at": ISODate(...)
+  "error":       null,
+  "created_at":  ISODate(...),
+  "updated_at":  ISODate(...)
 }
 ```
 
-`headers` is the single-value-per-name view (the common case). `Set-Cookie`
-is the one response header that legally repeats with different values, so it
-is captured raw in `set_cookie_headers` and parsed into the `cookies` map.
+`headers` is the single-value view. `Set-Cookie` is the one header that
+legitimately repeats — captured raw in `set_cookie_headers` and parsed
+into `cookies`.
 
-## Tests
+---
 
-Tests use [`mongomock-motor`](https://pypi.org/project/mongomock-motor/) for an
-in-memory Mongo replacement and `httpx.MockTransport` to stub upstream
-responses, so the suite is hermetic and fast.
+## Resilience
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-pytest -q
-```
-
-(Or `docker compose run --rm api pytest -q` once the image is built.)
-
-## Extending
-
-- Swap `BackgroundTasks` for a real queue (Celery, RQ, Arq) by replacing one
-  call site in `app/routers/metadata.py`; the service/repo layers are
-  untouched.
-- Add new fields to `MetadataRecord` + `MetadataRepository.upsert_ready`; the
-  router code does not need to change.
-- Add additional indexes (e.g. on `created_at` for TTL/cleanup) in
-  `MongoConnection.connect`.
+- `MongoConnection.connect` retries with backoff so the API survives Mongo
+  booting after it.
+- `api` service `depends_on: service_healthy` in compose — API starts
+  only once Mongo answers `ping`.
+- Fetcher errors (timeouts, DNS, TLS, redirect loops) are caught,
+  recorded as `status: failed`, and surfaced as `502` on POST. GET
+  treats `failed` like a miss and retries.
+- Response bodies are capped at `FETCH_MAX_BYTES` to stay within Mongo's
+  16 MB document limit.

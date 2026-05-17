@@ -16,7 +16,7 @@ class MetadataRepository:
     """Data access layer over the metadata collection.
 
     Keeps Mongo concerns out of the routers and service layer; the rest of
-    the app talks to this in terms of URLs and Pydantic records.
+    the application talks to this in terms of URLs and Pydantic records.
     """
 
     def __init__(self, collection: AsyncIOMotorCollection) -> None:
@@ -28,39 +28,54 @@ class MetadataRepository:
             return None
         return MetadataRecord.from_document(doc)
 
-    async def mark_pending(self, url: str) -> bool:
-        """Reserve a pending slot. Returns True if a new doc was created."""
+    async def mark_pending(self, url: str) -> None:
+        """Claim the URL for a collection attempt.
+
+        Sets ``status = pending`` and refreshes ``updated_at`` on every
+        call (so the route layer can use ``updated_at`` to decide if a
+        prior pending claim has gone stale). Defaults for headers /
+        cookies / body fields are only seeded on first insert so that
+        retrying a FAILED record keeps the prior error context until the
+        new attempt completes.
+
+        Callers MUST NOT invoke this on a record that is already READY:
+        the route layer guards against that.
+        """
         now = _utcnow()
-        result = await self._collection.update_one(
+        await self._collection.update_one(
             {"url": url},
             {
+                "$set": {
+                    "status": RecordStatus.PENDING.value,
+                    "updated_at": now,
+                },
                 "$setOnInsert": {
                     "url": url,
-                    "status": RecordStatus.PENDING.value,
+                    "created_at": now,
+                    "final_url": None,
                     "headers": {},
                     "set_cookie_headers": [],
                     "cookies": {},
                     "page_source": None,
                     "status_code": None,
                     "error": None,
-                    "created_at": now,
-                    "updated_at": now,
-                }
+                },
             },
             upsert=True,
         )
-        return result.upserted_id is not None
 
     async def upsert_ready(
         self,
         url: str,
         *,
         status_code: int,
+        final_url: str,
         headers: Dict[str, str],
         set_cookie_headers: List[str],
         cookies: Dict[str, str],
         page_source: str,
     ) -> None:
+        """Persist a successful collection result for ``url``."""
         now = _utcnow()
         await self._collection.update_one(
             {"url": url},
@@ -68,6 +83,7 @@ class MetadataRepository:
                 "$set": {
                     "status": RecordStatus.READY.value,
                     "status_code": status_code,
+                    "final_url": final_url,
                     "headers": headers,
                     "set_cookie_headers": set_cookie_headers,
                     "cookies": cookies,
@@ -81,6 +97,7 @@ class MetadataRepository:
         )
 
     async def mark_failed(self, url: str, *, error: str) -> None:
+        """Persist a failed collection attempt with the error message."""
         now = _utcnow()
         await self._collection.update_one(
             {"url": url},
@@ -96,4 +113,5 @@ class MetadataRepository:
         )
 
     async def all(self) -> List[Dict[str, Any]]:
+        """Iterate every stored document. Test / admin use only."""
         return [doc async for doc in self._collection.find({})]

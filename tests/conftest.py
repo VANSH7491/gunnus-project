@@ -1,3 +1,17 @@
+"""Shared pytest fixtures.
+
+The hermetic test suite drives the FastAPI app through ``httpx.ASGITransport``
+with two stubs in place of real infrastructure:
+
+* ``mongomock-motor`` replaces MongoDB so tests do not need a running
+  database container.
+* ``httpx.MockTransport`` replaces the outbound HTTP client so tests do
+  not touch the network.
+
+The end-to-end live tests live in ``tests/test_integration.py`` behind
+the ``integration`` marker and DO hit the real network — they are opt-in
+(``pytest -m integration``).
+"""
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable
@@ -12,23 +26,32 @@ from app.config import Settings, get_settings
 from app.database import MongoConnection
 from app.main import create_app
 
-DEFAULT_BODY = "<html><head><title>Example</title></head><body>Hello</body></html>"
+# A small bit of real-looking HTML used as the default mocked response.
+DEFAULT_BODY = "<html><head><title>Test page</title></head><body>Hello</body></html>"
 
 
 @pytest.fixture
 def settings() -> Settings:
+    """Settings for the hermetic test stack.
+
+    ``ALLOW_PRIVATE_HOSTS=True`` is required because the mocked URLs do
+    not resolve via DNS — we don't want the SSRF guard rejecting them
+    before MockTransport gets a chance to serve them.
+    """
     return Settings(
         MONGO_URI="mongodb://test/",
         MONGO_DB="metadata_inventory_test",
         MONGO_COLLECTION="pages",
         FETCH_TIMEOUT_SECONDS=5.0,
+        ALLOW_PRIVATE_HOSTS=True,
+        PENDING_GRACE_SECONDS=30.0,
         LOG_LEVEL="WARNING",
     )
 
 
 @pytest.fixture
 def transport_handler() -> Dict[str, Callable[[httpx.Request], httpx.Response]]:
-    """Mutable registry of per-URL handlers used by the mocked transport."""
+    """Mutable URL→handler registry consulted by the mocked transport."""
     return {}
 
 
@@ -51,9 +74,8 @@ def mock_transport(transport_handler):
 async def app_and_client(settings, mock_transport) -> AsyncIterator[tuple]:
     """FastAPI app wired against an in-memory Mongo and a mocked httpx client.
 
-    The real lifespan would dial a live MongoDB, so we bypass it and
-    populate ``app.state`` directly with the same objects it would create
-    (mocked Mongo + httpx client backed by ``MockTransport``).
+    The real lifespan would dial a live MongoDB; we bypass it and populate
+    ``app.state`` directly with the same objects it would create.
     """
     app = create_app()
 
@@ -62,12 +84,11 @@ async def app_and_client(settings, mock_transport) -> AsyncIterator[tuple]:
     await mongo.ensure_indexes()
     app.state.mongo = mongo
 
-    # Match the lifespan: app.state.http_client is the shared client. The
-    # mock transport plugs in instead of a real network stack.
     mocked_http = httpx.AsyncClient(transport=mock_transport)
     app.state.http_client = mocked_http
 
-    # Ensure the cached get_settings() doesn't leak a real one from the env.
+    # The cached get_settings() must yield OUR settings, not whatever the
+    # environment provides.
     app.dependency_overrides[get_settings] = lambda: settings
 
     transport = httpx.ASGITransport(app=app)

@@ -11,7 +11,9 @@
       "Read(//opt/**)",
       "Read(//usr/bin/**)",
       "Bash(command -v conda mamba pyenv asdf)",
-      "Bash(.venv/bin/pytest -v)"
+      "Bash(.venv/bin/pytest -v)",
+      "Bash(chmod +x \"/Users/vanshagarwal/Downloads/Gunnu's project/scripts/smoke_test.py\")",
+      "Bash(.venv/bin/pytest)"
     ]
   }
 }

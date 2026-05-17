@@ -12,6 +12,6 @@ env
 .gitignore
 .idea
 .vscode
-tests
+.github
 *.md
 !README.md
